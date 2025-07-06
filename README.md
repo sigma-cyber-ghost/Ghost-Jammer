@@ -1,4 +1,4 @@
-# Ghost-Jammer - Professional WiFi Security Toolkit
+# Ghost-Wifi-Jammer - Professional WiFi Security
 
 Ghost-Jammer is a powerful WiFi security toolkit designed for authorized penetration testing and security research. It provides a comprehensive suite of tools for network scanning, deauthentication attacks, and handshake capture in an intuitive command-line interface.
 
